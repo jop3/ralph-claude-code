@@ -132,26 +132,21 @@ parse_json_response() {
     if [[ "$exit_signal" == "false" && "$has_result_field" == "true" ]]; then
         local result_text=$(jq -r '.result // ""' "$output_file" 2>/dev/null)
         if [[ -n "$result_text" ]] && echo "$result_text" | grep -q -- "---RALPH_STATUS---"; then
-            # Extract EXIT_SIGNAL value from RALPH_STATUS block within result text
-            local embedded_exit_sig
-            embedded_exit_sig=$(echo "$result_text" | grep "EXIT_SIGNAL:" | cut -d: -f2 | xargs)
-            if [[ -n "$embedded_exit_sig" ]]; then
-                # Explicit EXIT_SIGNAL found in RALPH_STATUS block
-                explicit_exit_signal_found="true"
-                if [[ "$embedded_exit_sig" == "true" ]]; then
-                    exit_signal="true"
-                    [[ "${VERBOSE_PROGRESS:-}" == "true" ]] && echo "DEBUG: Extracted EXIT_SIGNAL=true from .result RALPH_STATUS block" >&2
-                else
-                    exit_signal="false"
-                    [[ "${VERBOSE_PROGRESS:-}" == "true" ]] && echo "DEBUG: Extracted EXIT_SIGNAL=false from .result RALPH_STATUS block (respecting explicit intent)" >&2
-                fi
+            # Extract the RALPH_STATUS block content between markers
+            # This prevents matching EXIT_SIGNAL: mentions outside the block (e.g., in prose)
+            local ralph_block=$(echo "$result_text" | sed -n '/---RALPH_STATUS---/,/---END_RALPH_STATUS---/p')
+
+            # Extract EXIT_SIGNAL value from within the RALPH_STATUS block only
+            # Use tr instead of xargs for Windows/MSYS2 compatibility (xargs can fail with assertion errors)
+            local embedded_exit_sig=$(echo "$ralph_block" | grep "^EXIT_SIGNAL:" | cut -d: -f2 | tr -d '[:space:]' | head -1)
+            if [[ "$embedded_exit_sig" == "true" ]]; then
+                exit_signal="true"
+                [[ "${VERBOSE_PROGRESS:-}" == "true" ]] && echo "DEBUG: Extracted EXIT_SIGNAL=true from .result RALPH_STATUS block" >&2
             fi
-            # Also check STATUS field as fallback ONLY when EXIT_SIGNAL was not specified
-            # This respects explicit EXIT_SIGNAL: false which means "task complete, continue working"
-            local embedded_status
-            embedded_status=$(echo "$result_text" | grep "STATUS:" | cut -d: -f2 | xargs)
-            if [[ "$embedded_status" == "COMPLETE" && "$explicit_exit_signal_found" != "true" ]]; then
-                # STATUS: COMPLETE without any EXIT_SIGNAL field implies completion
+            # Also check STATUS field as fallback (within the block)
+            local embedded_status=$(echo "$ralph_block" | grep "^STATUS:" | cut -d: -f2 | tr -d '[:space:]' | head -1)
+            if [[ "$embedded_status" == "COMPLETE" && "$exit_signal" != "true" ]]; then
+                # STATUS: COMPLETE without explicit EXIT_SIGNAL implies completion
                 exit_signal="true"
                 [[ "${VERBOSE_PROGRESS:-}" == "true" ]] && echo "DEBUG: Inferred EXIT_SIGNAL=true from .result STATUS=COMPLETE (no explicit EXIT_SIGNAL found)" >&2
             fi
