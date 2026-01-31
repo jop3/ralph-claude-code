@@ -138,13 +138,13 @@ parse_json_response() {
 
             # Extract EXIT_SIGNAL value from within the RALPH_STATUS block only
             # Use tr instead of xargs for Windows/MSYS2 compatibility (xargs can fail with assertion errors)
-            local embedded_exit_sig=$(echo "$ralph_block" | grep "^EXIT_SIGNAL:" | cut -d: -f2 | tr -d '[:space:]' | head -1)
+            local embedded_exit_sig=$(echo "$ralph_block" | grep "^EXIT_SIGNAL:" | head -1 | cut -d: -f2 | tr -d '[:space:]')
             if [[ "$embedded_exit_sig" == "true" ]]; then
                 exit_signal="true"
                 [[ "${VERBOSE_PROGRESS:-}" == "true" ]] && echo "DEBUG: Extracted EXIT_SIGNAL=true from .result RALPH_STATUS block" >&2
             fi
             # Also check STATUS field as fallback (within the block)
-            local embedded_status=$(echo "$ralph_block" | grep "^STATUS:" | cut -d: -f2 | tr -d '[:space:]' | head -1)
+            local embedded_status=$(echo "$ralph_block" | grep "^STATUS:" | head -1 | cut -d: -f2 | tr -d '[:space:]')
             if [[ "$embedded_status" == "COMPLETE" && "$exit_signal" != "true" ]]; then
                 # STATUS: COMPLETE without explicit EXIT_SIGNAL implies completion
                 exit_signal="true"
@@ -444,9 +444,11 @@ analyze_response() {
 
     # 1. Check for explicit structured output (if Claude follows schema)
     if grep -q -- "---RALPH_STATUS---" "$output_file"; then
-        # Parse structured output
-        local status=$(grep "STATUS:" "$output_file" | cut -d: -f2 | xargs)
-        local exit_sig=$(grep "EXIT_SIGNAL:" "$output_file" | cut -d: -f2 | xargs)
+        # Parse structured output - extract from RALPH_STATUS block only
+        # Use sed to extract block, tr instead of xargs for portability
+        local ralph_block=$(sed -n '/---RALPH_STATUS---/,/---END_RALPH_STATUS---/p' "$output_file")
+        local status=$(echo "$ralph_block" | grep "^STATUS:" | head -1 | cut -d: -f2 | tr -d '[:space:]')
+        local exit_sig=$(echo "$ralph_block" | grep "^EXIT_SIGNAL:" | head -1 | cut -d: -f2 | tr -d '[:space:]')
 
         # If EXIT_SIGNAL is explicitly provided, respect it
         if [[ -n "$exit_sig" ]]; then

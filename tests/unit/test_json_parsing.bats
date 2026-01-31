@@ -897,6 +897,29 @@ EOF
     [[ "$stored_session" == *"session-persist-array-test"* ]]
 }
 
+# Regression test: EXIT_SIGNAL mentioned in both prose and RALPH_STATUS block
+# Issue: Ralph looped 58 times because EXIT_SIGNAL parsing captured both mentions
+@test "parse_json_response extracts EXIT_SIGNAL only from RALPH_STATUS block" {
+    local output_file="$LOG_DIR/test_output.log"
+
+    # Simulates Claude mentioning EXIT_SIGNAL in prose AND in RALPH_STATUS block
+    cat > "$output_file" << 'EOF'
+{"type":"result","subtype":"success","result":"All work complete. EXIT_SIGNAL: `true`. Ready for staging.\n\n```\n---RALPH_STATUS---\nSTATUS: COMPLETE\nEXIT_SIGNAL: true\n---END_RALPH_STATUS---\n```","session_id":"test-session"}
+EOF
+
+    # Don't use 'run' to avoid subshell issues on Windows/MSYS2
+    parse_json_response "$output_file"
+    local parse_status=$?
+    assert_equal "$parse_status" "0"
+
+    local result_file="$RALPH_DIR/.json_parse_result"
+    [[ -f "$result_file" ]]
+
+    # EXIT_SIGNAL should be true (extracted from RALPH_STATUS block, not prose)
+    local exit_signal=$(jq -r '.exit_signal' "$result_file")
+    assert_equal "$exit_signal" "true"
+}
+
 # Regression test: arrays where only result element carries session_id (review fix: CodeRabbit)
 @test "parse_json_response extracts session_id from result object when no init message" {
     local output_file="$LOG_DIR/test_output.log"
