@@ -16,6 +16,7 @@ source "$SCRIPT_DIR/lib/date_utils.sh"
 source "$SCRIPT_DIR/lib/timeout_utils.sh"
 source "$SCRIPT_DIR/lib/response_analyzer.sh"
 source "$SCRIPT_DIR/lib/circuit_breaker.sh"
+source "$SCRIPT_DIR/lib/recovery.sh"
 source "$SCRIPT_DIR/lib/file_protection.sh"
 
 # Configuration
@@ -33,6 +34,8 @@ LIVE_LOG_FILE="$RALPH_DIR/live.log"  # Fixed file for live output monitoring
 CALL_COUNT_FILE="$RALPH_DIR/.call_count"
 TIMESTAMP_FILE="$RALPH_DIR/.last_reset"
 USE_TMUX=false
+SCHEDULE_START=""              # HH:MM — wait until this time before starting
+SCHEDULE_STOP=""               # HH:MM — stop execution at this time
 
 # Save environment variable state BEFORE setting defaults
 # These are used by load_ralphrc() to determine which values came from environment
@@ -699,6 +702,16 @@ build_loop_context() {
         if [[ -n "$prev_summary" && "$prev_summary" != "null" ]]; then
             context+="Previous: ${prev_summary}"
         fi
+    fi
+
+    # Append recovery prompt if present (Ouroboros recovery)
+    if [[ -f "$RALPH_DIR/.recovery_prompt" ]]; then
+        local recovery_prompt
+        recovery_prompt=$(cat "$RALPH_DIR/.recovery_prompt" 2>/dev/null)
+        if [[ -n "$recovery_prompt" ]]; then
+            context+=" ${recovery_prompt}"
+        fi
+        rm -f "$RALPH_DIR/.recovery_prompt"
     fi
 
     # Limit total length to ~500 chars
@@ -1473,13 +1486,74 @@ EOF
         fi
         local output_length=$(wc -c < "$output_file" 2>/dev/null || echo 0)
 
+        # Record loop history for stagnation detection (Ouroboros)
+        record_loop_history "$loop_count"
+
+        # Drift detection (Ouroboros)
+        local work_summary=""
+        if [[ -f "$RESPONSE_ANALYSIS_FILE" ]]; then
+            work_summary=$(jq -r '.analysis.work_summary // ""' "$RESPONSE_ANALYSIS_FILE" 2>/dev/null)
+        fi
+        local drift_detected=false
+        if [[ -n "$work_summary" && "$work_summary" != "null" ]]; then
+            if detect_drift "$work_summary"; then
+                drift_detected=true
+                [[ "$VERBOSE_PROGRESS" == "true" ]] && log_status "WARN" "Drift from goals detected"
+            fi
+        fi
+
         # Record result in circuit breaker
         record_loop_result "$loop_count" "$files_changed" "$has_errors" "$output_length"
         local circuit_result=$?
 
         if [[ $circuit_result -ne 0 ]]; then
-            log_status "WARN" "Circuit breaker opened - halting execution"
-            return 3  # Special code for circuit breaker trip
+            # Attempt recovery before halting (Ouroboros)
+            local stagnation_type=""
+            if [[ "$drift_detected" == "true" ]]; then
+                stagnation_type="drift"
+            else
+                stagnation_type=$(detect_stagnation_pattern) || stagnation_type=""
+            fi
+
+            # Fall back to circuit breaker reason if no specific pattern
+            if [[ -z "$stagnation_type" ]]; then
+                local cb_reason
+                cb_reason=$(jq -r '.reason // ""' "$RALPH_DIR/.circuit_breaker_state" 2>/dev/null)
+                if echo "$cb_reason" | grep -qi "same error"; then
+                    stagnation_type="same_error"
+                elif echo "$cb_reason" | grep -qi "no progress"; then
+                    stagnation_type="no_progress"
+                fi
+            fi
+
+            if attempt_recovery "${stagnation_type:-no_progress}"; then
+                log_status "INFO" "Recovery attempt $(get_recovery_attempts)/$RECOVERY_MAX_ATTEMPTS for: ${stagnation_type:-no_progress}"
+                # Reset circuit breaker to HALF_OPEN so loop continues
+                local total_opens
+                total_opens=$(jq -r '.total_opens // 0' "$RALPH_DIR/.circuit_breaker_state" 2>/dev/null || echo "0")
+                cat > "$RALPH_DIR/.circuit_breaker_state" << CBEOF
+{
+    "state": "HALF_OPEN",
+    "last_change": "$(get_iso_timestamp)",
+    "consecutive_no_progress": 0,
+    "consecutive_same_error": 0,
+    "consecutive_permission_denials": 0,
+    "last_progress_loop": $loop_count,
+    "total_opens": $total_opens,
+    "reason": "Recovery attempt for ${stagnation_type:-no_progress}",
+    "current_loop": $loop_count
+}
+CBEOF
+                return 0  # Continue loop
+            else
+                log_status "WARN" "Circuit breaker opened - recovery exhausted, halting execution"
+                return 3  # Special code for circuit breaker trip
+            fi
+        fi
+
+        # Reset recovery on progress (Ouroboros)
+        if [[ $files_changed -gt 0 ]]; then
+            reset_recovery
         fi
 
         return 0
@@ -1530,6 +1604,93 @@ trap cleanup SIGINT SIGTERM
 # Global variable for loop count (needed by cleanup function)
 loop_count=0
 
+# Parse HH:MM time string to seconds since midnight
+# Returns seconds on stdout, exit 1 on invalid format
+parse_time_hhmm() {
+    local time_str="$1"
+    if [[ ! "$time_str" =~ ^([0-9]{1,2}):([0-9]{2})$ ]]; then
+        echo "Error: Invalid time format '$time_str'. Use HH:MM (e.g. 23:00)" >&2
+        return 1
+    fi
+    local hours="${BASH_REMATCH[1]}"
+    local minutes="${BASH_REMATCH[2]}"
+    # Strip leading zeros for arithmetic
+    hours=$((10#$hours))
+    minutes=$((10#$minutes))
+    if [[ $hours -gt 23 || $minutes -gt 59 ]]; then
+        echo "Error: Invalid time '$time_str'. Hours 0-23, minutes 0-59." >&2
+        return 1
+    fi
+    echo $(( hours * 3600 + minutes * 60 ))
+}
+
+# Get current time as seconds since midnight
+current_time_seconds() {
+    local h m s
+    h=$(date +%H)
+    m=$(date +%M)
+    s=$(date +%S)
+    echo $(( 10#$h * 3600 + 10#$m * 60 + 10#$s ))
+}
+
+# Wait until SCHEDULE_START time, then begin
+wait_until_start_time() {
+    if [[ -z "$SCHEDULE_START" ]]; then
+        return 0
+    fi
+
+    local target_secs
+    target_secs=$(parse_time_hhmm "$SCHEDULE_START") || exit 1
+    local now_secs
+    now_secs=$(current_time_seconds)
+
+    local wait_secs=$(( target_secs - now_secs ))
+    # If target is in the past, assume next day
+    if [[ $wait_secs -le 0 ]]; then
+        wait_secs=$(( wait_secs + 86400 ))
+    fi
+
+    local wait_min=$(( wait_secs / 60 ))
+    log_status "INFO" "⏰ Scheduled start at $SCHEDULE_START — waiting ${wait_min} minutes..."
+    sleep "$wait_secs"
+    log_status "SUCCESS" "⏰ Start time reached, beginning execution"
+}
+
+# Check if current time has passed SCHEDULE_STOP
+# Returns 0 if should stop, 1 if can continue
+should_stop_for_schedule() {
+    if [[ -z "$SCHEDULE_STOP" ]]; then
+        return 1
+    fi
+
+    local stop_secs
+    stop_secs=$(parse_time_hhmm "$SCHEDULE_STOP") || return 1
+    local now_secs
+    now_secs=$(current_time_seconds)
+
+    # Simple check: if we've passed the stop time
+    # Handle wrap-around: if start > stop, we're doing an overnight run
+    if [[ -n "$SCHEDULE_START" ]]; then
+        local start_secs
+        start_secs=$(parse_time_hhmm "$SCHEDULE_START") || return 1
+
+        if [[ $start_secs -gt $stop_secs ]]; then
+            # Overnight run (e.g. 23:00 → 06:00)
+            # Stop if we're past stop time AND before start time (i.e. in the morning)
+            if [[ $now_secs -ge $stop_secs && $now_secs -lt $start_secs ]]; then
+                return 0
+            fi
+            return 1
+        fi
+    fi
+
+    # Same-day run or no start time: stop if past stop time
+    if [[ $now_secs -ge $stop_secs ]]; then
+        return 0
+    fi
+    return 1
+}
+
 # Main loop
 main() {
     # Load project-specific configuration from .ralphrc
@@ -1545,8 +1706,12 @@ main() {
         exit 1
     fi
 
+    # Wait for scheduled start time if set
+    wait_until_start_time
+
     log_status "SUCCESS" "🚀 Ralph loop starting with Claude Code"
     log_status "INFO" "Max calls per hour: $MAX_CALLS_PER_HOUR"
+    [[ -n "$SCHEDULE_STOP" ]] && log_status "INFO" "Scheduled stop: $SCHEDULE_STOP"
     log_status "INFO" "Logs: $LOG_DIR/ | Docs: $DOCS_DIR/ | Status: $STATUS_FILE"
 
     # Check if project uses old flat structure and needs migration
@@ -1623,6 +1788,14 @@ main() {
             echo ""
             reset_session "integrity_failure"
             update_status "$loop_count" "$(cat "$CALL_COUNT_FILE" 2>/dev/null || echo 0)" "integrity_failure" "halted" "files_deleted"
+            break
+        fi
+
+        # Check scheduled stop time
+        if should_stop_for_schedule; then
+            log_status "SUCCESS" "⏰ Scheduled stop time ($SCHEDULE_STOP) reached — shutting down"
+            reset_session "scheduled_stop"
+            update_status "$loop_count" "$(cat "$CALL_COUNT_FILE" 2>/dev/null || echo 0)" "scheduled_stop" "completed" "stop_time_reached"
             break
         fi
 
@@ -1785,6 +1958,8 @@ Options:
     --circuit-status        Show circuit breaker status and exit
     --auto-reset-circuit    Auto-reset circuit breaker on startup (bypasses cooldown)
     --reset-session         Reset session state and exit (clears session continuity)
+    --start HH:MM           Wait until this time before starting (e.g. --start 23:00)
+    --stop HH:MM            Stop execution at this time (e.g. --stop 06:00)
 
 Modern CLI Options (Phase 1.1):
     --output-format FORMAT  Set Claude output format: json or text (default: $CLAUDE_OUTPUT_FORMAT)
@@ -1817,6 +1992,8 @@ Examples:
     $0 --output-format text     # Use legacy text output format
     $0 --no-continue            # Disable session continuity
     $0 --session-expiry 48      # 48-hour session expiration
+    $0 --start 23:00            # Wait until 23:00 then start
+    $0 --start 23:00 --stop 06:00  # Run overnight, stop at 06:00
 
 HELPEOF
 }
@@ -1921,6 +2098,26 @@ while [[ $# -gt 0 ]]; do
         --auto-reset-circuit)
             CB_AUTO_RESET=true
             shift
+            ;;
+        --start)
+            if [[ -z "$2" ]]; then
+                echo "Error: --start requires a time in HH:MM format"
+                exit 1
+            fi
+            SCHEDULE_START="$2"
+            # Validate format early
+            parse_time_hhmm "$2" > /dev/null || exit 1
+            shift 2
+            ;;
+        --stop)
+            if [[ -z "$2" ]]; then
+                echo "Error: --stop requires a time in HH:MM format"
+                exit 1
+            fi
+            SCHEDULE_STOP="$2"
+            # Validate format early
+            parse_time_hhmm "$2" > /dev/null || exit 1
+            shift 2
             ;;
         *)
             echo "Unknown option: $1"
