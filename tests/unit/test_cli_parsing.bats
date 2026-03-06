@@ -380,6 +380,9 @@ build_ralph_cmd_for_test() {
     local CLAUDE_ALLOWED_TOOLS="${6:-Write,Read,Edit,Bash(git add *),Bash(git commit *),Bash(git diff *),Bash(git log *),Bash(git status),Bash(git status *),Bash(git push *),Bash(git pull *),Bash(git fetch *),Bash(git checkout *),Bash(git branch *),Bash(git stash *),Bash(git merge *),Bash(git tag *),Bash(npm *),Bash(pytest)}"
     local CLAUDE_USE_CONTINUE="${7:-true}"
     local CLAUDE_SESSION_EXPIRY_HOURS="${8:-24}"
+    local CB_AUTO_RESET="${9:-false}"
+    local SCHEDULE_START="${10:-}"
+    local SCHEDULE_STOP="${11:-}"
     local RALPH_DIR=".ralph"
 
     # Forward --calls if non-default
@@ -413,6 +416,18 @@ build_ralph_cmd_for_test() {
     # Forward --session-expiry if non-default (default is 24)
     if [[ "$CLAUDE_SESSION_EXPIRY_HOURS" != "24" ]]; then
         ralph_cmd="$ralph_cmd --session-expiry $CLAUDE_SESSION_EXPIRY_HOURS"
+    fi
+    # Forward --auto-reset-circuit if enabled
+    if [[ "$CB_AUTO_RESET" == "true" ]]; then
+        ralph_cmd="$ralph_cmd --auto-reset-circuit"
+    fi
+    # Forward --start if set
+    if [[ -n "$SCHEDULE_START" ]]; then
+        ralph_cmd="$ralph_cmd --start $SCHEDULE_START"
+    fi
+    # Forward --stop if set
+    if [[ -n "$SCHEDULE_STOP" ]]; then
+        ralph_cmd="$ralph_cmd --stop $SCHEDULE_STOP"
     fi
 
     echo "$ralph_cmd"
@@ -457,6 +472,22 @@ build_ralph_cmd_for_test() {
     [[ "$result" == *"--allowed-tools 'Read,Write'"* ]]
     [[ "$result" == *"--no-continue"* ]]
     [[ "$result" == *"--session-expiry 12"* ]]
+}
+
+@test "monitor forwards --start parameter" {
+    local result=$(build_ralph_cmd_for_test 100 ".ralph/PROMPT.md" "json" "false" "15" "Write,Bash(git *),Read" "true" "24" "false" "23:00")
+    [[ "$result" == *"--start 23:00"* ]]
+}
+
+@test "monitor forwards --stop parameter" {
+    local result=$(build_ralph_cmd_for_test 100 ".ralph/PROMPT.md" "json" "false" "15" "Write,Bash(git *),Read" "true" "24" "false" "" "06:00")
+    [[ "$result" == *"--stop 06:00"* ]]
+}
+
+@test "monitor forwards --start and --stop together" {
+    local result=$(build_ralph_cmd_for_test 100 ".ralph/PROMPT.md" "json" "false" "15" "Write,Bash(git *),Read" "true" "24" "false" "23:00" "06:00")
+    [[ "$result" == *"--start 23:00"* ]]
+    [[ "$result" == *"--stop 06:00"* ]]
 }
 
 @test "monitor does not forward default parameters" {

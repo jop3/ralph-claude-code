@@ -48,5 +48,8 @@ target/
 # Claude Code local settings
 .claude/settings.local.json
 
+# Windows NUL device redirect artifacts
+nul
+
 # Ralph backup directories (created by migration)
 .ralph_backup_*

@@ -728,6 +728,10 @@ BEADS_FILTER="status:open"
 CB_NO_PROGRESS_THRESHOLD=3
 CB_SAME_ERROR_THRESHOLD=5
 CB_OUTPUT_DECLINE_THRESHOLD=70
+
+# Scheduling (HH:MM format, leave empty to disable)
+# SCHEDULE_START=23:00    # Wait until this time before starting
+# SCHEDULE_STOP=06:00     # Stop execution at this time
 RALPHRCEOF
 }
 

@@ -335,6 +335,14 @@ setup_tmux_session() {
     if [[ "$CB_AUTO_RESET" == "true" ]]; then
         ralph_cmd="$ralph_cmd --auto-reset-circuit"
     fi
+    # Forward --start if set
+    if [[ -n "$SCHEDULE_START" ]]; then
+        ralph_cmd="$ralph_cmd --start $SCHEDULE_START"
+    fi
+    # Forward --stop if set
+    if [[ -n "$SCHEDULE_STOP" ]]; then
+        ralph_cmd="$ralph_cmd --stop $SCHEDULE_STOP"
+    fi
 
     # Chain tmux kill-session after the loop command so the entire tmux
     # session is torn down when the Ralph loop exits (graceful completion,
